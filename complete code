@@ -1,0 +1,429 @@
+# Cell 1: Install all required libraries
+!pip install transformers torch librosa scikit-learn soundfile pandas
+print("--- Libraries installed ---")
+
+# Cell 2: Import all necessary modules
+import numpy as np
+import pandas as pd
+import librosa
+import soundfile as sf
+import os
+import torch
+
+from google.colab import drive
+from google.colab import files
+from google.colab import userdata
+
+from transformers import AutoFeatureExtractor, AutoModel
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report
+from collections import defaultdict
+
+print("--- Modules imported ---")
+
+
+# Cell 3: Mount Google Drive
+print("--- Mounting Google Drive... ---")
+drive.mount('/content/drive')
+print("--- Drive mounted successfully ---")
+
+import pandas as pd
+from pathlib import Path
+import os
+
+# --- 1. Your main audio folder path ---
+AUDIO_ROOT_FOLDER = "/content/drive/MyDrive/IIITH DATASET/iiith dataset mixed"
+
+# --- 2. Where your new CSV file will be saved ---
+OUTPUT_CSV_FILE = "/content/drive/MyDrive/IIITH DATASET/iiith dataset mixed/metadata.csv"
+
+print(f"Scanning for audio files in: {AUDIO_ROOT_FOLDER}")
+
+# This uses pathlib to make finding files easier
+root_path = Path(AUDIO_ROOT_FOLDER)
+
+# Use rglob to find all .wav files in all subfolders
+audio_files = list(root_path.rglob("*.wav"))
+
+if not audio_files:
+    print(f"ERROR: No .wav files found in {AUDIO_ROOT_FOLDER}.")
+    print("Please check your path and that you have .wav files.")
+else:
+    print(f"Found {len(audio_files)} .wav files. Processing...")
+
+    metadata_list = []
+
+    for file_path in audio_files:
+        try:
+            # --- THIS IS THE NEW LOGIC ---
+
+            # Get just the filename (e.g., "Andhra_speaker (68).wav")
+            file_name = file_path.name
+
+            # Split the filename by "_" and take the first part
+            # e.g., "Andhra_speaker (68).wav" becomes "Andhra"
+            accent_label = file_name.split('_')[0]
+
+            # Append the data as a dictionary
+            metadata_list.append({
+                "file_path": str(file_path), # The full path as a string
+                "accent": accent_label,
+                "age": "unknown",     # We can't get this from the filename
+                "level": "unknown"    # We can't get this from the filename
+            })
+
+        except Exception as e:
+            # This will catch any files with weird names, like ".DS_Store"
+            print(f"Skipping {file_path}: Error processing file. {e}")
+
+    # --- 4. Create DataFrame and save to CSV (Same as before) ---
+    if metadata_list:
+        df = pd.DataFrame(metadata_list)
+
+        # This will remove any rows that failed (just in case)
+        df.dropna(inplace=True)
+
+        df.to_csv(OUTPUT_CSV_FILE, index=False)
+
+        print(f"\nSuccessfully created metadata.csv at {OUTPUT_CSV_FILE}")
+        print("Here's a preview of your new CSV:")
+        print(df.head())
+    else:
+        print("No files were processed successfully. CSV not created.")
+
+
+
+
+# Cell 4: Load Your Real Dataset from Google Drive
+# 🛑 ACTION REQUIRED:
+# 1. Make sure you have a metadata.csv file in your Google Drive.
+# 2. This CSV must have columns: 'file_path', 'accent', 'age', 'level'
+# 3. The 'file_path' column must be the FULL path, e.g., '/content/drive/MyDrive/data/audio1.wav'
+# 4. Update the path below to point to your CSV file.
+
+# The previous path '/content/drive/MyDrive/IIITH DATASET/iiith dataset mixed' was identified as not containing 'metadata.csv'.
+# Please ensure DATASET_CSV_PATH points directly to your *actual* CSV file.
+# For example, if your CSV is named 'my_audio_metadata.csv' inside that directory:
+# DATASET_CSV_PATH = "/content/drive/MyDrive/IIITH DATASET/iiith dataset mixed/my_audio_metadata.csv"
+DATASET_CSV_PATH = "/content/drive/MyDrive/IIITH DATASET/iiith dataset mixed/metadata.csv" # <-- 🛑 Update this with your actual CSV file path
+
+print(f"--- Loading metadata from {DATASET_CSV_PATH}... ---")
+
+try:
+    df = pd.read_csv(DATASET_CSV_PATH)
+
+    # Convert the DataFrame into the list format expected by the rest of the script
+    metadata_list = []
+    for _, row in df.iterrows():
+        metadata_list.append({
+            "file_path": row['file_path'],
+            "accent": row['accent'],
+            "age": row['age'],
+            "level": row['level']
+        })
+
+    print(f"Successfully loaded {len(metadata_list)} records.")
+    print("Example metadata entry:", metadata_list[0])
+
+except FileNotFoundError:
+    print(f"ERROR: File not found at {DATASET_CSV_PATH}")
+    print("Please check the path and try again. You can use `!ls -F \"/content/drive/MyDrive/IIITH DATASET/iiith dataset mixed\"` to see files in that directory.")
+except KeyError as e:
+    print(f"ERROR: Missing expected column in CSV: {e}")
+    print("Please ensure your CSV has 'file_path', 'accent', 'age', and 'level' columns.")
+
+
+# Cell 5: Load HuBERT Model Securely
+print("--- Loading HuBERT model... ---")
+
+# Securely get the HF_TOKEN from Colab Secrets
+HF_TOKEN = userdata.get('HF_TOKEN')
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN not found in Colab Secrets. Please add it via 'View' -> 'Command palette' -> 'Add secret'")
+
+# Set the token for the Hugging Face hub
+os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+
+model_name = "facebook/hubert-base-ls960"
+
+# Use AutoFeatureExtractor for the base model
+processor = AutoFeatureExtractor.from_pretrained(model_name, token=HF_TOKEN)
+hubert_model = AutoModel.from_pretrained(model_name, token=HF_TOKEN)
+
+print("--- HuBERT loaded successfully ---")
+
+
+
+
+# Cell 6: Define Feature Extraction Functions
+
+def get_audio(file_path, target_sr=16000):
+    """Loads and resamples audio to 16kHz."""
+    y, sr = librosa.load(file_path, sr=None)
+    if sr != target_sr:
+        y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+    return y, target_sr
+
+def extract_mfcc(y, sr, n_mfcc=20):
+    """Extracts MFCCs and returns the mean."""
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    mean_mfccs = np.mean(mfccs.T, axis=0)
+    return mean_mfccs
+
+def extract_hubert(y, sr, processor, model):
+    """Extracts HuBERT embeddings and returns the mean."""
+    inputs = processor(y, sampling_rate=sr, return_tensors="pt")
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # Take the mean across the time (num_frames) axis
+    mean_embedding = outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+    return mean_embedding
+
+print("--- Feature extraction functions defined ---")
+
+
+
+# Cell 7: Preprocessing, Feature Fusion, AND Model Training
+
+# --- PART 1: FEATURE EXTRACTION (Same as before) ---
+print("--- Starting feature extraction on all files... ---")
+all_features = []
+all_labels_strings = [] # Renamed for clarity
+all_metadata_tags = []
+
+for item in metadata_list:
+    try:
+        y, sr = get_audio(item["file_path"])
+        mfcc_feat = extract_mfcc(y, sr)
+        hubert_feat = extract_hubert(y, sr, processor, hubert_model)
+        combined_features = np.concatenate((mfcc_feat, hubert_feat))
+
+        all_features.append(combined_features)
+        all_labels_strings.append(item["accent"]) # Get the string labels
+        all_metadata_tags.append(item)
+
+    except Exception as e:
+        print(f"Error processing {item['file_path']}: {e}")
+
+X = np.array(all_features)
+y_strings = np.array(all_labels_strings)
+
+print(f"--- Preprocessing complete ---")
+print(f"Feature matrix 'X' shape: {X.shape}")
+print(f"Label vector 'y_strings' shape: {y_strings.shape}")
+
+
+# --- PART 2: THE FIX (Label Encoding & Training) ---
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, classification_report
+import numpy as np
+
+# ==============================================================================
+# ✨ MODIFICATION START: Import the new model ✨
+from sklearn.svm import SVC
+# ==============================================================================
+
+
+# --- 2a. ENCODE STRING LABELS TO INTEGERS ---
+print("--- Encoding string labels to integers... ---")
+# This creates the 'label_encoder' that Cell 9 also needs
+label_encoder = LabelEncoder()
+y_numeric = label_encoder.fit_transform(y_strings)
+
+print("Label mapping (String -> Number):")
+for i, label in enumerate(label_encoder.classes_):
+    print(f"  {label}: {i}")
+
+# --- 2b. Split your data (using the new numeric labels) ---
+print("--- Splitting data into train and test sets... ---")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_numeric,      # Use y_numeric here!
+    test_size=0.2,
+    random_state=42,
+    stratify=y_numeric # Stratify by the numeric labels
+)
+
+print(f"Training samples: {len(X_train)}")
+print(f"Testing samples: {len(X_test)}")
+
+# --- 2c. Scale the features ---
+print("--- Scaling features... ---")
+final_scaler = StandardScaler()
+X_train_scaled = final_scaler.fit_transform(X_train)
+X_test_scaled = final_scaler.transform(X_test)
+
+# --- 2d. Train the final model ---
+print("--- Training final accent recognition model... ---")
+
+# ==============================================================================
+# ✨ MODIFICATION START: Model changed from MLPClassifier to SVC ✨
+#
+# We are swapping the MLPClassifier for a Support Vector Classifier (SVC).
+# SVCs are highly efficient and often more accurate for high-dimensional
+# feature vectors (like our 788-dim combined features).
+#
+print("--- Using Support Vector Classifier (SVC) for training ---")
+final_model = SVC(
+    kernel='rbf',      # The 'rbf' kernel is a powerful default for non-linear data
+    C=1.0,             # Standard regularization parameter
+    gamma='scale',     # Automatically adjusts gamma based on # of features
+    random_state=42,
+    verbose=True       # Show that training is in progress
+)
+#
+# ✨ MODIFICATION END ✨
+# ==============================================================================
+
+
+final_model.fit(X_train_scaled, y_train) # This will now work
+print("--- Model training complete ---")
+
+# --- 2e. Evaluate the model ---
+print("\n--- Model Evaluation on Test Set ---")
+y_pred = final_model.predict(X_test_scaled)
+accuracy = accuracy_score(y_test, y_pred)
+
+print(f"Overall Accuracy: {accuracy * 100:.2f}%")
+print("\nClassification Report:")
+# We use label_encoder.classes_ to show the original string names
+print(classification_report(y_test, y_pred, target_names=label_encoder.classes_, zero_division=0))
+
+
+
+
+# Cell 8: Save (Export) Your Trained Models
+import joblib
+from google.colab import files
+
+print("--- Saving trained models... ---")
+
+# 1. Define filenames
+MODEL_FILE = "accent_model_svc.joblib"
+SCALER_FILE = "accent_scaler.joblib"
+ENCODER_FILE = "accent_label_encoder.joblib"
+
+# 2. Save the objects using joblib
+joblib.dump(final_model, MODEL_FILE)
+joblib.dump(final_scaler, SCALER_FILE)
+joblib.dump(label_encoder, ENCODER_FILE)
+
+print(f"Successfully saved:")
+print(f"  - {MODEL_FILE}")
+print(f"  - {SCALER_FILE}")
+print(f"  - {ENCODER_FILE}")
+
+# 3. Download all three files to your local computer
+print("\nDownloading files to your computer...")
+files.download(MODEL_FILE)
+files.download(SCALER_FILE)
+files.download(ENCODER_FILE)
+
+# Cell 9: Final Application (Corrected)
+
+from google.colab import files
+import os
+import numpy as np
+
+print("\n==========================================================")
+print("--- Final Application: Cuisine Mapper ---")
+print("==========================================================")
+
+# 1. Define the Cuisine Database
+cuisine_map = {
+    "Andhra": {
+        "region": "Andhra Pradesh",
+        "dishes": ["Pesarattu", "Hyder_abadi Biryani", "Gutti Vankaya Kura"]
+    },
+    "Tamil": {
+        "region": "Tamil Nadu",
+        "dishes": ["Dosa", "Sambar", "Idli", "Chettinad Chicken"]
+    },
+    "Karnataka": {
+        "region": "Karnataka",
+        "dishes": ["Bisi Bele Bath", "Mysore Pak", "Akki Roti"]
+    },
+    "Kerala": {
+        "region": "Kerala",
+        "dishes": ["Appam with Stew", "Puttu and Kadala Curry", "Sadya"]
+    },
+    "Gujrat": { # Make sure this spelling matches your label
+        "region": "Gujarat",
+        "dishes": ["Dhokla", "Khandvi", "Thepla"]
+    },
+    "Jharkhand": {
+        "region": "Jharkhand",
+        "dishes": ["Litti Chokha", "Dhuska", "Thekua"]
+    }
+}
+
+# 2. Define the prediction pipeline (NOW INCLUDES 'label_encoder')
+def predict_accent_and_cuisine(file_path, model, scaler, label_encoder, processor, hubert_model):
+    print(f"--- Analyzing new file: {file_path} ---")
+
+    try:
+        y, sr = get_audio(file_path)
+        mfcc_feat = extract_mfcc(y, sr)
+        hubert_feat = extract_hubert(y, sr, processor, hubert_model)
+        combined_features = np.concatenate((mfcc_feat, hubert_feat))
+        scaled_features = scaler.transform([combined_features])
+
+        # --- THIS IS THE FIX ---
+        # 4a. Make Prediction (will be a number, e.g., 2)
+        predicted_label_numeric = model.predict(scaled_features)[0]
+
+        # 4b. Convert the number back to a string
+        predicted_accent_string = label_encoder.inverse_transform([predicted_label_numeric])[0]
+        # --- END FIX ---
+
+        # 5. Map to Cuisine (using the string label)
+        cuisine_info = cuisine_map.get(predicted_accent_string, {
+            "region": "Unknown",
+            "dishes": ["No recommendation available."]
+        })
+
+        print(f"\nPrediction Complete:")
+        print(f"Predicted Accent: {predicted_accent_string.capitalize()}")
+        print(f"Native Region: {cuisine_info['region']}")
+        print(f"Cuisine Suggestions: {', '.join(cuisine_info['dishes'])}")
+
+        return predicted_accent_string, cuisine_info
+
+    except Exception as e:
+        print(f"Error during prediction for {file_path}: {e}")
+        return None, None
+
+# --- DEMONSTRATION: UPLOAD YOUR OWN FILE FOR TESTING ---
+
+if 'final_model' in locals() and 'label_encoder' in locals():
+    print("\n--- Running Final Pipeline Demonstration ---")
+    print("Please upload your own audio file to test.")
+
+    uploaded = files.upload()
+
+    if len(uploaded.keys()) == 0:
+        print("No file uploaded. Aborting test.")
+    else:
+        test_file_path = list(uploaded.keys())[0]
+
+        # Run the prediction (NOW PASSING 'label_encoder')
+        predict_accent_and_cuisine(
+            test_file_path,
+            final_model,
+            final_scaler,
+            label_encoder,  # <-- Pass the encoder here
+            processor,
+            hubert_model
+        )
+
+        os.remove(test_file_path)
+else:
+    print("\n--- Final Pipeline Demonstration Skipped ---")
+    print("Could not find 'final_model' or 'label_encoder'.")
+    print("Please make sure you have run Cell 7 successfully.")
