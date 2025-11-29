@@ -1,6 +1,14 @@
 # Cuisine-recommender
 It is a cuisine recommender based on accent identified from english speech
 # 🎙️ Accent-Based Cuisine Recommender  
+
+### 👥 Team Name: **REPRO**
+
+### 👩‍💻 Team Members:
+1. **Lakshmi Krishna V R**  
+2. **Krishnendu A**  
+3. **Mohammed Faiz**  
+
 ### Predict an Indian regional accent from an audio sample and get matching cuisine recommendations.
 
 🔗 **Live Working Application:**  
